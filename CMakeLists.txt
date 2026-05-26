@@ -42,8 +42,12 @@ set(cpu_PARAMS
 
 # Sources
 set(sources_SRCS
-	${CMAKE_CURRENT_SOURCE_DIR}/Src/main.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Src/main.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Src/system_stm32f4xx.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Src/clock/clock.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Src/gpio/gpio.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Src/timer/timer.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Src/exti/exti.c
 )
 
 # Include directories for all compilers
@@ -51,6 +55,11 @@ set(include_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/Inc
     ${CMAKE_CURRENT_SOURCE_DIR}/Inc/CMSIS/Core/Include
     ${CMAKE_CURRENT_SOURCE_DIR}/Inc/CMSIS/Device
+    ${CMAKE_CURRENT_SOURCE_DIR}/Src
+    ${CMAKE_CURRENT_SOURCE_DIR}/Src/clock
+    ${CMAKE_CURRENT_SOURCE_DIR}/Src/gpio
+    ${CMAKE_CURRENT_SOURCE_DIR}/Src/timer
+    ${CMAKE_CURRENT_SOURCE_DIR}/Src/exti
 )
 
 # Include directories for each compiler
