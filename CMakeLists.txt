@@ -49,7 +49,7 @@ set(sources_SRCS
 # Include directories for all compilers
 set(include_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/Inc
-    ${CMAKE_CURRENT_SOURCE_DIR}/Inc/CMSIS/Core
+    ${CMAKE_CURRENT_SOURCE_DIR}/Inc/CMSIS/Core/Include
     ${CMAKE_CURRENT_SOURCE_DIR}/Inc/CMSIS/Device
 )
 
