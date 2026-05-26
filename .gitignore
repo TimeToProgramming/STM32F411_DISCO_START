@@ -1,0 +1,18 @@
+# Build output
+build/
+
+# VS Code local settings (nie commituj swoich ścieżek)
+.vscode/settings.json
+.vscode/launch.json
+
+# Pliki tymczasowe
+*.map
+*.bin
+*.hex
+*.elf
+*.o
+*.d
+
+# System
+.DS_Store
+Thumbs.db

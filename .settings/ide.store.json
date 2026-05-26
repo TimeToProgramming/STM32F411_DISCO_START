@@ -1,0 +1,10 @@
+{
+  "board": "STM32F411E-DISCO",
+  "device": "STM32F411VET6",
+  "core": "Cortex-M4",
+  "order": 0,
+  "toolchain": "GCC",
+  "source": {
+    "sourceType": "Empty"
+  }
+}
