@@ -7,6 +7,7 @@
 #include "uart/uart.h"
 #include "spi/spi.h"
 #include "l3gd20/l3gd20.h"
+#include "filters/filters.h"
 
 /* ================================================ */
 /*              KONFIGURACJA PWM                    */
@@ -135,31 +136,60 @@ static void vGyroTask(void *pv) {
     (void)pv;
 
     /*
-     * Inicjalizacja żyroskopu:
-     * CS = PE3 (wg schematu Discovery)
-     * Zakres ±250°/s — najdokładniejszy, czułość 8.75 mdps/digit
-     * Diagnostyka WHO_AM_I wypisywana przez UART wewnątrz L3GD20_Init
+     * Inicjalizacja żyroskopu.
+     * CS = PE3, zakres ±250°/s
      */
     if (!L3GD20_Init(&hgyro, &hspi1, GPIOE, 3, L3GD20_SCALE_250DPS)) {
         UART_Printf(&huart2, "L3GD20 init FAILED!\r\n");
-        vTaskDelete(NULL);  /* Usuń task — bez czujnika nie ma sensu działać */
+        vTaskDelete(NULL);
     }
 
-    UART_Printf(&huart2, "L3GD20 OK — start odczytu\r\n");
+    UART_Printf(&huart2, "L3GD20 OK\r\n");
 
+    /*
+     * Deklaracja zmiennych — dane i offsety kalibracji.
+     * offset wypełni Gyro_Calibrate, potem odejmujemy go
+     * od każdego pomiaru przez Gyro_ApplyOffset.
+     */
     L3GD20_Data_t data;
+    Gyro_Offset_t offset;
+
+    /*
+     * Kalibracja offsetu — płytka musi stać nieruchomo!
+     * 500 próbek × 1ms = ~0.5s
+     * Wynik: offset.x/y/z = średnia z próbek = błąd zera czujnika
+     */
+    UART_Printf(&huart2, "Calibrating — keep still!\r\n");
+    Gyro_Calibrate(&hgyro, &offset, 500);
+    UART_Printf(&huart2, "Offsets: X=%.3f Y=%.3f Z=%.3f\r\n",
+                offset.x, offset.y, offset.z);
+
+    /*
+     * Inicjalizacja filtrów LPF dla każdej osi.
+     * alpha=0.15 — umiarkowane wygładzanie
+     * Im mniejsze alpha tym gładszy sygnał ale większe opóźnienie
+     */
+    LPF_t lpf_x, lpf_y, lpf_z;
+    LPF_Init(&lpf_x, 0.15f);
+    LPF_Init(&lpf_y, 0.15f);
+    LPF_Init(&lpf_z, 0.15f);
+
     for (;;) {
-        /*
-         * Odczyt danych przeliczonych na °/s.
-         * 100ms → 10Hz — wystarczy do logowania i debugowania.
-         * Docelowo przy PID będziemy czytać 1kHz.
-         */
         if (L3GD20_ReadDPS(&hgyro, &data)) {
+
+            /* Odejmij offset kalibracji */
+            Gyro_ApplyOffset(&data, &offset);
+
+            /* Przefiltruj każdą oś przez LPF */
+            data.x = LPF_Update(&lpf_x, data.x);
+            data.y = LPF_Update(&lpf_y, data.y);
+            data.z = LPF_Update(&lpf_z, data.z);
+
             UART_Printf(&huart2,
                         "X: %6.2f  Y: %6.2f  Z: %6.2f [deg/s]\r\n",
                         data.x, data.y, data.z);
         }
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(10));  /* 100Hz */
     }
 }
 
