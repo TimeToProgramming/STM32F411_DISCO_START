@@ -134,10 +134,72 @@ void TIM_ConfigPWM(TIM_TypeDef *TIMx, uint8_t Channel,
 
 void TIM_SetCCR(TIM_TypeDef *TIMx, uint8_t Channel, uint32_t CCR) {
     switch (Channel) {
-        case 1: TIMx->CCR1 = CCR; break;
-        case 2: TIMx->CCR2 = CCR; break;
-        case 3: TIMx->CCR3 = CCR; break;
-        case 4: TIMx->CCR4 = CCR; break;
+        case 1:
+            TIMx->CCR1 = CCR;
+            if (CCR == 0) TIMx->CCER &= ~TIM_CCER_CC1E;
+            else          TIMx->CCER |=  TIM_CCER_CC1E;
+            break;
+        case 2:
+            TIMx->CCR2 = CCR;
+            if (CCR == 0) TIMx->CCER &= ~TIM_CCER_CC2E;
+            else          TIMx->CCER |=  TIM_CCER_CC2E;
+            break;
+        case 3:
+            TIMx->CCR3 = CCR;
+            if (CCR == 0) TIMx->CCER &= ~TIM_CCER_CC3E;
+            else          TIMx->CCER |=  TIM_CCER_CC3E;
+            break;
+        case 4:
+            TIMx->CCR4 = CCR;
+            if (CCR == 0) TIMx->CCER &= ~TIM_CCER_CC4E;
+            else          TIMx->CCER |=  TIM_CCER_CC4E;
+            break;
         default: return;
     }
+}
+
+void TIM_ConfigChannel(TIM_TypeDef *TIMx, uint8_t Channel,
+                       uint32_t CCR, uint8_t Polarity, uint8_t PWMMode) {
+    uint32_t oc_mode = (PWMMode == TIM_PWM_MODE1)
+        ? (TIM_CCMR1_OC1M_1 | TIM_CCMR1_OC1M_2)
+        : (TIM_CCMR1_OC1M_0 | TIM_CCMR1_OC1M_2);
+
+    switch (Channel) {
+        case 1:
+            TIMx->CCMR1 &= ~TIM_CCMR1_OC1M;
+            TIMx->CCMR1 |= oc_mode | TIM_CCMR1_OC1PE;
+            TIMx->CCER  &= ~TIM_CCER_CC1P;
+            if (Polarity == TIM_POLARITY_LOW) TIMx->CCER |= TIM_CCER_CC1P;
+            TIMx->CCER  |= TIM_CCER_CC1E;
+            TIMx->CCR1   = CCR;
+            break;
+        case 2:
+            TIMx->CCMR1 &= ~TIM_CCMR1_OC2M;
+            TIMx->CCMR1 |= (oc_mode << 8) | TIM_CCMR1_OC2PE;
+            TIMx->CCER  &= ~TIM_CCER_CC2P;
+            if (Polarity == TIM_POLARITY_LOW) TIMx->CCER |= TIM_CCER_CC2P;
+            TIMx->CCER  |= TIM_CCER_CC2E;
+            TIMx->CCR2   = CCR;
+            break;
+        case 3:
+            TIMx->CCMR2 &= ~TIM_CCMR2_OC3M;
+            TIMx->CCMR2 |= oc_mode | TIM_CCMR2_OC3PE;
+            TIMx->CCER  &= ~TIM_CCER_CC3P;
+            if (Polarity == TIM_POLARITY_LOW) TIMx->CCER |= TIM_CCER_CC3P;
+            TIMx->CCER  |= TIM_CCER_CC3E;
+            TIMx->CCR3   = CCR;
+            break;
+        case 4:
+            TIMx->CCMR2 &= ~TIM_CCMR2_OC4M;
+            TIMx->CCMR2 |= (oc_mode << 8) | TIM_CCMR2_OC4PE;
+            TIMx->CCER  &= ~TIM_CCER_CC4P;
+            if (Polarity == TIM_POLARITY_LOW) TIMx->CCER |= TIM_CCER_CC4P;
+            TIMx->CCER  |= TIM_CCER_CC4E;
+            TIMx->CCR4   = CCR;
+            break;
+        default: return;
+    }
+
+    // Wymuś przeładowanie rejestrów — zapobiega tleniu przy CCR=0
+    TIMx->EGR |= TIM_EGR_UG;
 }

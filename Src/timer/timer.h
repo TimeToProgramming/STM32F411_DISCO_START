@@ -30,3 +30,5 @@ void TIM_ConfigPWM(TIM_TypeDef *TIMx, uint8_t Channel,
                    uint32_t PSC, uint32_t ARR, uint32_t CCR,
                    uint8_t Polarity, uint8_t PWMMode);
 void TIM_SetCCR(TIM_TypeDef *TIMx, uint8_t Channel, uint32_t CCR);
+void TIM_ConfigChannel(TIM_TypeDef *TIMx, uint8_t Channel,
+                       uint32_t CCR, uint8_t Polarity, uint8_t PWMMode);
