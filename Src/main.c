@@ -8,6 +8,15 @@
 #include "spi/spi.h"
 #include "l3gd20/l3gd20.h"
 #include "filters/filters.h"
+#include "event_groups.h"
+#include <math.h>
+
+#define GYRO_MAX_DPS  50.0f
+
+
+// Flaga — bit 0 = kalibracja skończona
+EventGroupHandle_t xSystemEvents;
+#define FLAG_CALIB_DONE  (1 << 0)
 
 /* ================================================ */
 /*              KONFIGURACJA PWM                    */
@@ -56,70 +65,83 @@ static void vPWMTask(void *pv) {
 
     /*
      * Inicjalizacja TIM4:
-     * APB1=50MHz → TIM4 clock = APB1×2 = 100MHz
-     * PSC=99  → f_timer = 100MHz/100 = 1MHz
-     * ARR=999 → f_PWM  = 1MHz/1000  = 1kHz
-     * ARPE — preload ARR, zmiana ARR wchodzi synchronicznie po przepełnieniu
-     * EGR_UG — wymuś natychmiastowe załadowanie PSC i ARR do rejestrów shadow
+     * PSC=99 → 1MHz, ARR=999 → 1kHz PWM
      */
     TIM_Config(TIM4, TIM_MODE_PWM, 99, ARR_VAL);
     TIM4->CR1 |= TIM_CR1_ARPE;
     TIM4->EGR |= TIM_EGR_UG;
-
-    /*
-     * CH1-CH4 startują z CCR=0 (zgaszone).
-     * PWM Mode 1, polaryzacja HIGH:
-     * pin=HIGH gdy CNT < CCR → jasność proporcjonalna do CCR/ARR
-     */
     TIM_ConfigChannel(TIM4, 1, 0, TIM_POLARITY_HIGH, TIM_PWM_MODE1);
     TIM_ConfigChannel(TIM4, 2, 0, TIM_POLARITY_HIGH, TIM_PWM_MODE1);
     TIM_ConfigChannel(TIM4, 3, 0, TIM_POLARITY_HIGH, TIM_PWM_MODE1);
     TIM_ConfigChannel(TIM4, 4, 0, TIM_POLARITY_HIGH, TIM_PWM_MODE1);
-
-    /* Start timera — od tej chwili generuje PWM */
     TIM4->CR1 |= TIM_CR1_CEN;
 
-    for (;;) {
-        /* CH1 (zielona PD12) — rozjaśnianie 0→ARR */
+    /*
+     * Animacja podczas kalibracji — diody kręcą się w kółko.
+     * xEventGroupGetBits sprawdza flagę bez blokowania taska.
+     * Gdy task Gyro skończy kalibrację i ustawi flagę — wychodzimy.
+     */
+    while (!(xEventGroupGetBits(xSystemEvents) & FLAG_CALIB_DONE)) {
+
+        /* Rozjaśnianie po kolei CH1→CH2→CH3→CH4 */
         for (int ccr = 0; ccr <= ARR_VAL; ccr += PWM_STEP)
             { TIM_SetCCR(TIM4, 1, ccr); vTaskDelay(pdMS_TO_TICKS(STEP_DELAY)); }
-        TIM_SetCCR(TIM4, 1, ARR_VAL); /* Gwarancja pełnej jasności */
+        TIM_SetCCR(TIM4, 1, ARR_VAL);
 
-        /* CH2 (pomarańczowa PD13) — rozjaśnianie */
         for (int ccr = 0; ccr <= ARR_VAL; ccr += PWM_STEP)
             { TIM_SetCCR(TIM4, 2, ccr); vTaskDelay(pdMS_TO_TICKS(STEP_DELAY)); }
         TIM_SetCCR(TIM4, 2, ARR_VAL);
 
-        /* CH3 (czerwona PD14) — rozjaśnianie */
         for (int ccr = 0; ccr <= ARR_VAL; ccr += PWM_STEP)
             { TIM_SetCCR(TIM4, 3, ccr); vTaskDelay(pdMS_TO_TICKS(STEP_DELAY)); }
         TIM_SetCCR(TIM4, 3, ARR_VAL);
 
-        /* CH4 (niebieska PD15) — rozjaśnianie */
         for (int ccr = 0; ccr <= ARR_VAL; ccr += PWM_STEP)
             { TIM_SetCCR(TIM4, 4, ccr); vTaskDelay(pdMS_TO_TICKS(STEP_DELAY)); }
         TIM_SetCCR(TIM4, 4, ARR_VAL);
 
-        /* CH1 — gaszenie ARR→0 */
+        /* Gaszenie po kolei CH1→CH2→CH3→CH4 */
         for (int ccr = ARR_VAL; ccr >= 0; ccr -= PWM_STEP)
             { TIM_SetCCR(TIM4, 1, ccr); vTaskDelay(pdMS_TO_TICKS(STEP_DELAY)); }
-        TIM_SetCCR(TIM4, 1, 0); /* Gwarancja pełnego zgaszenia */
+        TIM_SetCCR(TIM4, 1, 0);
 
-        /* CH2 — gaszenie */
         for (int ccr = ARR_VAL; ccr >= 0; ccr -= PWM_STEP)
             { TIM_SetCCR(TIM4, 2, ccr); vTaskDelay(pdMS_TO_TICKS(STEP_DELAY)); }
         TIM_SetCCR(TIM4, 2, 0);
 
-        /* CH3 — gaszenie */
         for (int ccr = ARR_VAL; ccr >= 0; ccr -= PWM_STEP)
             { TIM_SetCCR(TIM4, 3, ccr); vTaskDelay(pdMS_TO_TICKS(STEP_DELAY)); }
         TIM_SetCCR(TIM4, 3, 0);
 
-        /* CH4 — gaszenie */
         for (int ccr = ARR_VAL; ccr >= 0; ccr -= PWM_STEP)
             { TIM_SetCCR(TIM4, 4, ccr); vTaskDelay(pdMS_TO_TICKS(STEP_DELAY)); }
         TIM_SetCCR(TIM4, 4, 0);
     }
+
+    /*
+    * Kalibracja skończona — wszystkie diody zaświecają i gasną
+    * jako sygnał "gotowy do pracy"
+    */
+    for (int ccr = 0; ccr <= ARR_VAL; ccr += PWM_STEP)
+        { TIM_SetCCR(TIM4, 1, ccr);
+        TIM_SetCCR(TIM4, 2, ccr);
+        TIM_SetCCR(TIM4, 3, ccr);
+        TIM_SetCCR(TIM4, 4, ccr);
+        vTaskDelay(pdMS_TO_TICKS(STEP_DELAY)); }
+
+    for (int ccr = ARR_VAL; ccr >= 0; ccr -= PWM_STEP)
+        { TIM_SetCCR(TIM4, 1, ccr);
+        TIM_SetCCR(TIM4, 2, ccr);
+        TIM_SetCCR(TIM4, 3, ccr);
+        TIM_SetCCR(TIM4, 4, ccr);
+        vTaskDelay(pdMS_TO_TICKS(STEP_DELAY)); }
+
+    TIM_SetCCR(TIM4, 1, 0);
+    TIM_SetCCR(TIM4, 2, 0);
+    TIM_SetCCR(TIM4, 3, 0);
+    TIM_SetCCR(TIM4, 4, 0);
+
+    vTaskDelete(NULL);
 }
 
 /* ================================================ */
@@ -135,61 +157,74 @@ static void vPWMTask(void *pv) {
 static void vGyroTask(void *pv) {
     (void)pv;
 
-    /*
-     * Inicjalizacja żyroskopu.
-     * CS = PE3, zakres ±250°/s
-     */
     if (!L3GD20_Init(&hgyro, &hspi1, GPIOE, 3, L3GD20_SCALE_250DPS)) {
         UART_Printf(&huart2, "L3GD20 init FAILED!\r\n");
         vTaskDelete(NULL);
     }
-
     UART_Printf(&huart2, "L3GD20 OK\r\n");
 
-    /*
-     * Deklaracja zmiennych — dane i offsety kalibracji.
-     * offset wypełni Gyro_Calibrate, potem odejmujemy go
-     * od każdego pomiaru przez Gyro_ApplyOffset.
-     */
     L3GD20_Data_t data;
     Gyro_Offset_t offset;
 
-    /*
-     * Kalibracja offsetu — płytka musi stać nieruchomo!
-     * 500 próbek × 1ms = ~0.5s
-     * Wynik: offset.x/y/z = średnia z próbek = błąd zera czujnika
-     */
     UART_Printf(&huart2, "Calibrating — keep still!\r\n");
     Gyro_Calibrate(&hgyro, &offset, 500);
     UART_Printf(&huart2, "Offsets: X=%.3f Y=%.3f Z=%.3f\r\n",
                 offset.x, offset.y, offset.z);
 
-    /*
-     * Inicjalizacja filtrów LPF dla każdej osi.
-     * alpha=0.15 — umiarkowane wygładzanie
-     * Im mniejsze alpha tym gładszy sygnał ale większe opóźnienie
-     */
     LPF_t lpf_x, lpf_y, lpf_z;
     LPF_Init(&lpf_x, 0.15f);
     LPF_Init(&lpf_y, 0.15f);
     LPF_Init(&lpf_z, 0.15f);
 
+    /* Kalibracja skończona — obudź task PWM */
+    xEventGroupSetBits(xSystemEvents, FLAG_CALIB_DONE);
+
     for (;;) {
         if (L3GD20_ReadDPS(&hgyro, &data)) {
 
-            /* Odejmij offset kalibracji */
+            /* Odejmij offset i przefiltruj */
             Gyro_ApplyOffset(&data, &offset);
-
-            /* Przefiltruj każdą oś przez LPF */
             data.x = LPF_Update(&lpf_x, data.x);
             data.y = LPF_Update(&lpf_y, data.y);
             data.z = LPF_Update(&lpf_z, data.z);
+
+            /* ---- Wizualizacja na LEDach PWM ---- */
+
+            /*
+             * Oś X → CH1 (zielona) i CH2 (pomarańczowa)
+             * Jasność proporcjonalna do prędkości kątowej
+             * MAX_DPS = pełna jasność
+             */
+            uint32_t ccr_x = (uint32_t)(fabsf(data.x) / GYRO_MAX_DPS * 999.0f);
+            if (ccr_x > 999) ccr_x = 999;
+
+            if (data.x > 0.0f) {
+                TIM_SetCCR(TIM4, 2, ccr_x);  /* pomarańczowa */
+                TIM_SetCCR(TIM4, 1, 0);       /* zgaś zieloną */
+            } else {
+                TIM_SetCCR(TIM4, 1, ccr_x);  /* zielona */
+                TIM_SetCCR(TIM4, 2, 0);       /* zgaś pomarańczową */
+            }
+
+            /*
+             * Oś Y → CH3 (czerwona) i CH4 (niebieska)
+             */
+            uint32_t ccr_y = (uint32_t)(fabsf(data.y) / GYRO_MAX_DPS * 999.0f);
+            if (ccr_y > 999) ccr_y = 999;
+
+            if (data.y > 0.0f) {
+                TIM_SetCCR(TIM4, 4, ccr_y);  /* niebieska */
+                TIM_SetCCR(TIM4, 3, 0);       /* zgaś czerwoną */
+            } else {
+                TIM_SetCCR(TIM4, 3, ccr_y);  /* czerwona */
+                TIM_SetCCR(TIM4, 4, 0);       /* zgaś niebieską */
+            }
 
             UART_Printf(&huart2,
                         "X: %6.2f  Y: %6.2f  Z: %6.2f [deg/s]\r\n",
                         data.x, data.y, data.z);
         }
-        vTaskDelay(pdMS_TO_TICKS(10));  /* 100Hz */
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
@@ -203,6 +238,7 @@ int main(void) {
      * Bez tego peryferia taktowane z HSI 16MHz.
      */
     SystemClock_Config();
+    xSystemEvents = xEventGroupCreate();
 
     /*
      * UART2: PA2=TX, PA3=RX, 115200 baud
