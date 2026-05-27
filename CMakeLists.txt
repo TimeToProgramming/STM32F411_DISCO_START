@@ -50,6 +50,8 @@ set(sources_SRCS
     ${CMAKE_CURRENT_SOURCE_DIR}/Src/exti/exti.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Src/uart/uart.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Src/irq_handlers.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Src/spi/spi.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Src/l3gd20/l3gd20.c
 )
 
 # Include directories for all compilers
@@ -63,6 +65,8 @@ set(include_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/Src/timer
     ${CMAKE_CURRENT_SOURCE_DIR}/Src/exti
     ${CMAKE_CURRENT_SOURCE_DIR}/Src/uart
+    ${CMAKE_CURRENT_SOURCE_DIR}/Src/spi
+    ${CMAKE_CURRENT_SOURCE_DIR}/Src/l3gd20
 )
 
 # Include directories for each compiler

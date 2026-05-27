@@ -5,37 +5,40 @@
 #include "clock/clock.h"
 #include "timer/timer.h"
 #include "uart/uart.h"
+#include "spi/spi.h"
+#include "l3gd20/l3gd20.h"
 
 /* ================================================ */
 /*              KONFIGURACJA PWM                    */
 /* ================================================ */
-#define ARR_VAL     999   /* Okres PWM — razem z PSC=99 daje 1kHz przy 100MHz */
-#define PWM_STEP    10    /* Krok zmiany CCR — im mniejszy tym płynniejsze ściemnianie */
-#define STEP_DELAY  5     /* Czas między krokami w ms — reguluje szybkość animacji */
+#define ARR_VAL     999   /* Okres PWM — PSC=99, ARR=999 → 1kHz przy APB1×2=100MHz */
+#define PWM_STEP    10    /* Krok CCR — im mniejszy tym płynniejsze ściemnianie */
+#define STEP_DELAY  5     /* Czas między krokami [ms] — reguluje szybkość animacji */
 
 /* ================================================ */
-/*         GLOBALNY HANDLE UART                     */
+/*         GLOBALNE HANDLERY PERYFERÓW              */
 /* ================================================ */
 /*
- * Globalny — dostępny z każdego taska przez extern.
- * Inicjalizowany w main() przed startem schedulera.
- * Mutex wewnątrz chroni przed równoczesnym dostępem.
+ * Globalne — dostępne z każdego taska przez extern.
+ * Inicjalizowane w main() przed startem schedulera.
  */
-UART_Handle_t huart2;
+UART_Handle_t   huart2;  /* USART2: PA2=TX, PA3=RX, 115200 baud */
+SPI_Handle_t    hspi1;   /* SPI1:   PA5=SCK, PA6=MISO, PA7=MOSI */
+L3GD20_Handle_t hgyro;   /* Żyroskop L3GD20: CS=PE3 */
 
 /* ================================================ */
 /*              TASK PWM — animacja LED             */
 /* ================================================ */
 /*
  * Steruje czterema diodami przez TIM4 CH1-CH4 (PD12-PD15).
- * Każda dioda rozjaśnia się i gaśnie po kolei w pętli.
+ * Każda dioda rozjaśnia się i gaśnie po kolei w nieskończonej pętli.
  * vTaskDelay oddaje procesor innym taskom podczas czekania —
- * nie blokuje jak HAL_Delay.
+ * zero busy-waiting w przeciwieństwie do HAL_Delay.
  */
 static void vPWMTask(void *pv) {
     (void)pv;
 
-    /* Konfiguracja pinów PD12-PD15 jako AF2 = TIM4 CH1-CH4 */
+    /* Konfiguracja PD12-PD15 jako AF2 = TIM4 CH1-CH4 */
     GPIO_EnableClock(GPIOD);
     GPIO_ConfigPin(GPIOD, 12, GPIO_MODE_AF, GPIO_PULL_NONE, GPIO_OTYPE_PP);
     GPIO_ConfigPin(GPIOD, 13, GPIO_MODE_AF, GPIO_PULL_NONE, GPIO_OTYPE_PP);
@@ -52,19 +55,20 @@ static void vPWMTask(void *pv) {
 
     /*
      * Inicjalizacja TIM4:
-     * PSC=99 → f_timer = APB1×2 / (PSC+1) = 100MHz/100 = 1MHz
-     * ARR=999 → f_PWM = 1MHz / 1000 = 1kHz
-     * ARPE — preload ARR, zmiana ARR wchodzi po przepełnieniu
-     * EGR_UG — wymuś natychmiastowe załadowanie PSC i ARR
+     * APB1=50MHz → TIM4 clock = APB1×2 = 100MHz
+     * PSC=99  → f_timer = 100MHz/100 = 1MHz
+     * ARR=999 → f_PWM  = 1MHz/1000  = 1kHz
+     * ARPE — preload ARR, zmiana ARR wchodzi synchronicznie po przepełnieniu
+     * EGR_UG — wymuś natychmiastowe załadowanie PSC i ARR do rejestrów shadow
      */
     TIM_Config(TIM4, TIM_MODE_PWM, 99, ARR_VAL);
     TIM4->CR1 |= TIM_CR1_ARPE;
     TIM4->EGR |= TIM_EGR_UG;
 
     /*
-     * Konfiguracja kanałów CH1-CH4 z CCR=0 (zgaszone).
+     * CH1-CH4 startują z CCR=0 (zgaszone).
      * PWM Mode 1, polaryzacja HIGH:
-     * pin=HIGH gdy CNT < CCR → jasność rośnie wraz z CCR
+     * pin=HIGH gdy CNT < CCR → jasność proporcjonalna do CCR/ARR
      */
     TIM_ConfigChannel(TIM4, 1, 0, TIM_POLARITY_HIGH, TIM_PWM_MODE1);
     TIM_ConfigChannel(TIM4, 2, 0, TIM_POLARITY_HIGH, TIM_PWM_MODE1);
@@ -75,7 +79,7 @@ static void vPWMTask(void *pv) {
     TIM4->CR1 |= TIM_CR1_CEN;
 
     for (;;) {
-        /* CH1 (zielona PD12) — rozjaśnianie od 0 do ARR */
+        /* CH1 (zielona PD12) — rozjaśnianie 0→ARR */
         for (int ccr = 0; ccr <= ARR_VAL; ccr += PWM_STEP)
             { TIM_SetCCR(TIM4, 1, ccr); vTaskDelay(pdMS_TO_TICKS(STEP_DELAY)); }
         TIM_SetCCR(TIM4, 1, ARR_VAL); /* Gwarancja pełnej jasności */
@@ -95,7 +99,7 @@ static void vPWMTask(void *pv) {
             { TIM_SetCCR(TIM4, 4, ccr); vTaskDelay(pdMS_TO_TICKS(STEP_DELAY)); }
         TIM_SetCCR(TIM4, 4, ARR_VAL);
 
-        /* CH1 — gaszenie od ARR do 0 */
+        /* CH1 — gaszenie ARR→0 */
         for (int ccr = ARR_VAL; ccr >= 0; ccr -= PWM_STEP)
             { TIM_SetCCR(TIM4, 1, ccr); vTaskDelay(pdMS_TO_TICKS(STEP_DELAY)); }
         TIM_SetCCR(TIM4, 1, 0); /* Gwarancja pełnego zgaszenia */
@@ -118,31 +122,44 @@ static void vPWMTask(void *pv) {
 }
 
 /* ================================================ */
-/*          TASK DEBUG — logowanie przez UART       */
+/*          TASK GYRO — odczyt żyroskopu            */
 /* ================================================ */
 /*
- * Osobny task odpowiedzialny wyłącznie za komunikację UART.
- * Inne taski mogą też wywołać UART_Printf(&huart2, ...) —
- * mutex w bibliotece zadba o bezpieczeństwo.
- * Priorytet taki sam jak PWM — scheduler przydziela czas równo.
+ * Inicjalizuje L3GD20 i co 100ms odczytuje dane.
+ * Wypisuje X/Y/Z przez UART — mutex w bibliotece UART
+ * zadba o bezpieczeństwo przy równoległym dostępie.
+ * Priorytet 2 — wyższy niż PWM żeby odczyt czujnika
+ * nie był opóźniany przez animację LED.
  */
-static void vDebugTask(void *pv) {
+static void vGyroTask(void *pv) {
     (void)pv;
 
     /*
-     * Pierwsze wywołanie UART_Printf po starcie schedulera.
-     * Mutex działa dopiero gdy scheduler jest uruchomiony —
-     * dlatego Printf jest tu a nie w main().
+     * Inicjalizacja żyroskopu:
+     * CS = PE3 (wg schematu Discovery)
+     * Zakres ±250°/s — najdokładniejszy, czułość 8.75 mdps/digit
+     * Diagnostyka WHO_AM_I wypisywana przez UART wewnątrz L3GD20_Init
      */
-    UART_Printf(&huart2, "=== System start ===\r\n");
-    UART_Printf(&huart2, "Clock: %lu Hz\r\n", SystemCoreClock);
-    UART_Printf(&huart2, "RTOS tick: %lu Hz\r\n", configTICK_RATE_HZ);
+    if (!L3GD20_Init(&hgyro, &hspi1, GPIOE, 3, L3GD20_SCALE_250DPS)) {
+        UART_Printf(&huart2, "L3GD20 init FAILED!\r\n");
+        vTaskDelete(NULL);  /* Usuń task — bez czujnika nie ma sensu działać */
+    }
 
-    uint32_t tick = 0;
+    UART_Printf(&huart2, "L3GD20 OK — start odczytu\r\n");
+
+    L3GD20_Data_t data;
     for (;;) {
-        /* Co 500ms wyślij licznik — potwierdzenie że system żyje */
-        UART_Printf(&huart2, "tick: %lu\r\n", tick++);
-        vTaskDelay(pdMS_TO_TICKS(500));
+        /*
+         * Odczyt danych przeliczonych na °/s.
+         * 100ms → 10Hz — wystarczy do logowania i debugowania.
+         * Docelowo przy PID będziemy czytać 1kHz.
+         */
+        if (L3GD20_ReadDPS(&hgyro, &data)) {
+            UART_Printf(&huart2,
+                        "X: %6.2f  Y: %6.2f  Z: %6.2f [deg/s]\r\n",
+                        data.x, data.y, data.z);
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
@@ -151,17 +168,17 @@ static void vDebugTask(void *pv) {
 /* ================================================ */
 int main(void) {
     /*
-     * Konfiguracja zegara — pierwsze co robimy po resecie.
-     * Bez tego wszystkie peryferia taktowane z HSI 16MHz.
-     * Po tej funkcji SYSCLK = 100MHz z HSE 8MHz przez PLL.
+     * Zegar — pierwsze co robimy po resecie.
+     * HSE 8MHz → PLL → SYSCLK 100MHz.
+     * Bez tego peryferia taktowane z HSI 16MHz.
      */
     SystemClock_Config();
 
     /*
-     * Konfiguracja USART2 na PA2 (TX) i PA3 (RX).
-     * USART2 siedzi na APB1 = 50MHz — stąd ClockFreq.
-     * DMA1 Stream6 kanał 4 = USART2_TX (z tabeli DMA w RM).
-     * DMA1 Stream5 kanał 4 = USART2_RX (z tabeli DMA w RM).
+     * UART2: PA2=TX, PA3=RX, 115200 baud
+     * APB1=50MHz → ClockFreq=50000000
+     * DMA1 Stream6 Ch4 = USART2_TX
+     * DMA1 Stream5 Ch4 = USART2_RX
      */
     const UART_Config_t uart2_cfg = {
         .Instance     = USART2,
@@ -176,21 +193,48 @@ int main(void) {
         .DmaRxChannel = 4,
         .NvicPriority = configLIBRARY_MAX_SYSCALL_IRQ_PRIORITY
     };
-
     UART_Init(&huart2, &uart2_cfg);
 
     /*
-     * Tworzenie tasków — tylko rejestracja, nie uruchamiają się jeszcze.
-     * Stack 256 słów = 1KB RAM na task.
-     * Priorytet 1 — najniższy użytkownika (0 = Idle task FreeRTOS).
+     * SPI1: PA5=SCK, PA6=MISO, PA7=MOSI, AF5
+     * APB2=100MHz, BaudDiv=3 → 6.25MHz (L3GD20 max 10MHz)
+     * Mode 0 (CPOL=0, CPHA=0) — testujemy wg datasheet Fig.12
+     * "driven on falling, captured on rising edge"
+     * DMA2 Stream3 Ch3 = SPI1_TX
+     * DMA2 Stream0 Ch3 = SPI1_RX
      */
-    xTaskCreate(vPWMTask,   "PWM",   256, NULL, 1, NULL);
-    xTaskCreate(vDebugTask, "DEBUG", 256, NULL, 1, NULL);
+    const SPI_Config_t spi1_cfg = {
+        .Instance     = SPI1,
+        .ClockFreq    = 100000000U,
+        .SckPort      = GPIOA, .SckPin  = 5, .SckAF  = 5,
+        .MisoPort     = GPIOA, .MisoPin = 6, .MisoAF = 5,
+        .MosiPort     = GPIOA, .MosiPin = 7, .MosiAF = 5,
+        .DmaTxStream  = DMA2_Stream3,
+        .DmaTxChannel = 3,
+        .DmaTxIRQn    = DMA2_Stream3_IRQn,
+        .DmaRxStream  = DMA2_Stream0,
+        .DmaRxChannel = 3,
+        .DmaRxIRQn    = DMA2_Stream0_IRQn,
+        .NvicPriority = configLIBRARY_MAX_SYSCALL_IRQ_PRIORITY,
+        .CPOL         = 0,   /* SCK idle LOW */
+        .CPHA         = 0,   /* próbkuj na rosnącym zboczu */
+        .BaudDiv      = 3    /* /16 = 6.25MHz */
+    };
+    SPI_Init(&hspi1, &spi1_cfg);
 
     /*
-     * Start schedulera — od tej chwili FreeRTOS przejmuje kontrolę.
-     * Ta funkcja nigdy nie wraca.
-     * Jeśli wróci (błąd pamięci) — wpadamy w nieskończoną pętlę.
+     * Tworzenie tasków — rejestracja, nie uruchamiają się jeszcze.
+     * Stack 256 słów = 1KB RAM dla PWM.
+     * Stack 512 słów = 2KB RAM dla GYRO (float, printf).
+     * Priorytet GYRO=2 > PWM=1 — czujnik ważniejszy niż animacja.
+     */
+    xTaskCreate(vPWMTask,  "PWM",  256, NULL, 1, NULL);
+    xTaskCreate(vGyroTask, "GYRO", 512, NULL, 2, NULL);
+
+    /*
+     * Start schedulera — FreeRTOS przejmuje kontrolę.
+     * Nigdy nie wraca. Jeśli wróci (brak pamięci) —
+     * wpadamy w nieskończoną pętlę zamiast wykonywać losowy kod.
      */
     vTaskStartScheduler();
     for (;;) {}
