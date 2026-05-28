@@ -54,6 +54,7 @@ set(sources_SRCS
     ${CMAKE_CURRENT_SOURCE_DIR}/Src/l3gd20/l3gd20.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Src/filters/filters.c
     ${CMAKE_CURRENT_SOURCE_DIR}/FreeRTOS/event_groups.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Src/i2c/i2c.c
 )
 
 # Include directories for all compilers
@@ -71,6 +72,7 @@ set(include_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/Src/l3gd20
     ${CMAKE_CURRENT_SOURCE_DIR}/Src/filters
     ${CMAKE_CURRENT_SOURCE_DIR}/FreeRTOS/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/Src/i2c
 )
 
 # Include directories for each compiler

@@ -10,6 +10,8 @@
 #include "filters/filters.h"
 #include "event_groups.h"
 #include <math.h>
+#include "i2c/i2c.h"
+
 
 #define GYRO_MAX_DPS  50.0f
 
@@ -35,6 +37,8 @@ EventGroupHandle_t xSystemEvents;
 UART_Handle_t   huart2;  /* USART2: PA2=TX, PA3=RX, 115200 baud */
 SPI_Handle_t    hspi1;   /* SPI1:   PA5=SCK, PA6=MISO, PA7=MOSI */
 L3GD20_Handle_t hgyro;   /* Żyroskop L3GD20: CS=PE3 */
+I2C_Handle_t hi2c1;
+
 
 /* ================================================ */
 /*              TASK PWM — animacja LED             */
@@ -287,6 +291,26 @@ int main(void) {
         .BaudDiv      = 3    /* /16 = 6.25MHz */
     };
     SPI_Init(&hspi1, &spi1_cfg);
+
+    const I2C_Config_t i2c1_cfg = {
+        .Instance      = I2C1,
+        .ClockSpeed    = 400000U,        // 400kHz — fast mode
+        .ApbClockFreq  = 50000000U,      // APB1 = 50MHz
+        .SclPort       = GPIOB, .SclPin = 6, .SclAF = 4,
+        .SdaPort       = GPIOB, .SdaPin = 9, .SdaAF = 4,
+        .DmaTxStream   = DMA1_Stream1,   // I2C1 TX = Stream1 Ch0
+        .DmaTxChannel  = 0,
+        .DmaTxIRQn     = DMA1_Stream1_IRQn,
+        .DmaRxStream   = DMA1_Stream0,   // I2C1 RX = Stream0 Ch1
+        .DmaRxChannel  = 1,
+        .DmaRxIRQn     = DMA1_Stream0_IRQn,
+        .EventIRQn     = I2C1_EV_IRQn,
+        .ErrorIRQn     = I2C1_ER_IRQn,
+        .NvicPriority  = configLIBRARY_MAX_SYSCALL_IRQ_PRIORITY,
+        .MaxRetry      = 3
+    };
+
+    I2C_Init(&hi2c1, &i2c1_cfg);
 
     /*
      * Tworzenie tasków — rejestracja, nie uruchamiają się jeszcze.
