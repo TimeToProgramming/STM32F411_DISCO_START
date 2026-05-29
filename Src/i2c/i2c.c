@@ -328,24 +328,90 @@ void I2C_IRQHandler_CB(I2C_Handle_t *hi2c) {
 /*          PRZERWANIA DMA                          */
 /* ================================================ */
 
+/**
+ * @brief Kasuje wszystkie flagi statusu DMA dla podanego streamu.
+ *
+ * Rejestry flag (LISR/HISR, LIFCR/HIFCR) mają inne układy bitów
+ * dla każdego ze streamów 0-7. Funkcja oblicza właściwy rejestr
+ * i maskę na podstawie wskaźnika na stream.
+ *
+ * Rozkład bitów w LISR/HISR (po 6 bitów na stream, z 4-bitową przerwą):
+ *   Stream 0: bity [5:0]   (LIFCR)
+ *   Stream 1: bity [11:6]  (LIFCR)
+ *   Stream 2: bity [21:16] (LIFCR)  ← przerwa 4 bity między 1 a 2
+ *   Stream 3: bity [27:22] (LIFCR)
+ *   Stream 4: bity [5:0]   (HIFCR)
+ *   Stream 5: bity [11:6]  (HIFCR)
+ *   Stream 6: bity [21:16] (HIFCR)
+ *   Stream 7: bity [27:22] (HIFCR)
+ */
+static void DMA_ClearFlags(DMA_Stream_TypeDef *stream) {
+    /*
+     * Oblicz numer streamu (0-7) na podstawie adresu.
+     * Streamy są rozmieszczone co 0x18 bajtów od DMA1_Stream0.
+     */
+    uint32_t base   = (uint32_t)stream;
+    uint32_t origin = (base >= (uint32_t)DMA2_Stream0)
+                      ? (uint32_t)DMA2_Stream0
+                      : (uint32_t)DMA1_Stream0;
+    uint32_t num    = (base - origin) / 0x18U;  /* 0-7 */
+
+    /*
+     * Maska 6 flag (FE, DME, TE, HT, TC) dla streamu 0.
+     * Przesuwamy ją o właściwą liczbę bitów.
+     */
+    static const uint8_t shift_table[8] = { 0, 6, 16, 22, 0, 6, 16, 22 };
+    uint32_t mask = 0x3FU << shift_table[num];
+
+    if (num < 4) {
+        if (base >= (uint32_t)DMA2_Stream0) DMA2->LIFCR = mask;
+        else                                DMA1->LIFCR = mask;
+    } else {
+        if (base >= (uint32_t)DMA2_Stream0) DMA2->HIFCR = mask;
+        else                                DMA1->HIFCR = mask;
+    }
+}
+
 void I2C_DMA_TX_IRQHandler_CB(I2C_Handle_t *hi2c) {
     /*
-     * TC dla DMA TX — wszystkie bajty wysłane.
-     * Generujemy STOP i budzimy task.
+     * TC DMA TX - DMA przeslal wszystkie bajty do rejestru DR.
+     *
+     * WAZNE: TC DMA != bajt wyslany na magistrale.
+     * TC oznacza ze ostatni bajt jest w DR (shift register I2C
+     * moze jeszcze go wysylac). Wyslanie STOP przed BTF urywa
+     * ostatni bajt - slave dostaje niekompletny zapis do rejestru.
+     * Efekt: CTRL_REG1_A nie jest zapisany, czujnik zostaje
+     * w power-down mode, zwraca same zera.
+     *
+     * Procedura wg RM0383 sekcja 18.3.3 (DMA requests):
+     *   1. Wylacz DMA i DMAEN w CR2
+     *   2. Poczekaj na BTF (ostatni bajt wyslany i potwierdzony)
+     *   3. Dopiero teraz wyslij STOP
+     *
+     * BTF polling w ISR: maks ~20us przy 400kHz (1 bajt).
+     * Timeout petli zapobiega zawieszeniu przy bledzie magistrali.
      */
-    if (DMA1->LISR & DMA_LISR_TCIF1) {
-        DMA1->LIFCR = DMA_LIFCR_CTCIF1;
-        hi2c->Config.DmaTxStream->CR &= ~DMA_SxCR_EN;
-        hi2c->Config.Instance->CR2   &= ~(I2C_CR2_DMAEN | I2C_CR2_LAST);
-        hi2c->Config.Instance->CR1   |= I2C_CR1_STOP;
+    DMA_Stream_TypeDef *dma = hi2c->Config.DmaTxStream;
+    I2C_TypeDef        *i2c = hi2c->Config.Instance;
 
-        hi2c->State = I2C_STATE_IDLE;
-        hi2c->Busy  = false;
+    /* 1. Zatrzymaj DMA i wylacz zadania DMA w I2C */
+    DMA_ClearFlags(dma);
+    dma->CR &= ~DMA_SxCR_EN;
+    i2c->CR2 &= ~(I2C_CR2_DMAEN | I2C_CR2_LAST);
 
-        BaseType_t woken = pdFALSE;
-        xSemaphoreGiveFromISR(hi2c->Done, &woken);
-        portYIELD_FROM_ISR(woken);
-    }
+    /* 2. Czekaj na BTF - ostatni bajt faktycznie wyslany na magistrale */
+    uint32_t timeout = 10000U;
+    while (!(i2c->SR1 & I2C_SR1_BTF) && (--timeout > 0U));
+
+    /* 3. Teraz bezpiecznie wyslij STOP */
+    i2c->CR1 |= I2C_CR1_STOP;
+
+    hi2c->State = I2C_STATE_IDLE;
+    hi2c->Busy  = false;
+
+    BaseType_t woken = pdFALSE;
+    xSemaphoreGiveFromISR(hi2c->Done, &woken);
+    portYIELD_FROM_ISR(woken);
 }
 
 void I2C_DMA_RX_IRQHandler_CB(I2C_Handle_t *hi2c) {
@@ -353,21 +419,26 @@ void I2C_DMA_RX_IRQHandler_CB(I2C_Handle_t *hi2c) {
      * TC dla DMA RX — wszystkie bajty odebrane.
      * DMA automatycznie wygenerował NACK (bit LAST).
      * Generujemy STOP i budzimy task.
+     *
+     * [FIX] Poprzednia wersja hardkodowała DMA1->LISR & DMA_LISR_TCIF0
+     * i DMA1->LIFCR = DMA_LIFCR_CTCIF0 — działało tylko dla Stream0.
+     * Teraz używamy DMA_ClearFlags() która obsługuje dowolny stream.
      */
-    if (DMA1->LISR & DMA_LISR_TCIF0) {
-        DMA1->LIFCR = DMA_LIFCR_CTCIF0;
-        hi2c->Config.DmaRxStream->CR &= ~DMA_SxCR_EN;
-        hi2c->Config.Instance->CR1   &= ~I2C_CR1_ACK;
-        hi2c->Config.Instance->CR2   &= ~(I2C_CR2_DMAEN | I2C_CR2_LAST);
-        hi2c->Config.Instance->CR1   |= I2C_CR1_STOP;
+    DMA_Stream_TypeDef *dma = hi2c->Config.DmaRxStream;
 
-        hi2c->State = I2C_STATE_IDLE;
-        hi2c->Busy  = false;
+    DMA_ClearFlags(dma);
+    dma->CR &= ~DMA_SxCR_EN;
 
-        BaseType_t woken = pdFALSE;
-        xSemaphoreGiveFromISR(hi2c->Done, &woken);
-        portYIELD_FROM_ISR(woken);
-    }
+    hi2c->Config.Instance->CR1 &= ~I2C_CR1_ACK;
+    hi2c->Config.Instance->CR2 &= ~(I2C_CR2_DMAEN | I2C_CR2_LAST);
+    hi2c->Config.Instance->CR1 |=  I2C_CR1_STOP;
+
+    hi2c->State = I2C_STATE_IDLE;
+    hi2c->Busy  = false;
+
+    BaseType_t woken = pdFALSE;
+    xSemaphoreGiveFromISR(hi2c->Done, &woken);
+    portYIELD_FROM_ISR(woken);
 }
 
 /* ================================================ */
@@ -377,26 +448,36 @@ void I2C_DMA_RX_IRQHandler_CB(I2C_Handle_t *hi2c) {
 bool I2C_Write(I2C_Handle_t *hi2c, uint8_t addr,
                uint8_t *buf, uint16_t len, uint32_t timeout_ms) {
 
+    if (!hi2c || !buf || len == 0) return false;
     if (hi2c->Busy) return false;
 
-    /* Konfiguracja DMA TX */
+    /*
+     * Konfiguracja DMA TX.
+     *
+     * Kolejność kroków jest istotna:
+     *   1. Zeruj CR — zatrzymaj ewentualnie aktywny stream
+     *   2. Poczekaj na faktyczne zatrzymanie (sprzęt potrzebuje kilka cykli)
+     *   3. Wyczyść wszystkie flagi statusu — stare TC/TE nie mogą
+     *      fałszywie wyzwolić callbacku przed nową transakcją
+     *   4. Ustaw PAR/M0AR/NDTR/CR — parametry transferu
+     *
+     * [FIX] DMA_ClearFlags zamiast hardkodowanego LIFCR dla Stream1 —
+     *       poprzednia wersja blokowała każdy stream inny niż Stream1.
+     */
     DMA_Stream_TypeDef *dma = hi2c->Config.DmaTxStream;
     dma->CR = 0;
     while (dma->CR & DMA_SxCR_EN);
-
-    DMA1->LIFCR = DMA_LIFCR_CTCIF1 | DMA_LIFCR_CHTIF1
-                | DMA_LIFCR_CTEIF1 | DMA_LIFCR_CDMEIF1
-                | DMA_LIFCR_CFEIF1;
+    DMA_ClearFlags(dma);
 
     dma->PAR  = (uint32_t)&hi2c->Config.Instance->DR;
     dma->M0AR = (uint32_t)buf;
     dma->NDTR = len;
     dma->CR   = ((uint32_t)hi2c->Config.DmaTxChannel << DMA_SxCR_CHSEL_Pos)
-              | DMA_SxCR_MINC
-              | (1U << DMA_SxCR_DIR_Pos)
-              | DMA_SxCR_TCIE;
+              | DMA_SxCR_MINC           /* auto-increment adresu pamięci */
+              | (1U << DMA_SxCR_DIR_Pos)/* kierunek: pamięć → peryferium */
+              | DMA_SxCR_TCIE;          /* przerwanie po Transfer Complete */
 
-    /* Parametry transakcji */
+    /* Parametry transakcji — widoczne dla maszyny stanów w IRQ */
     hi2c->DevAddr    = addr;
     hi2c->Buffer     = buf;
     hi2c->Length     = len;
@@ -406,44 +487,70 @@ bool I2C_Write(I2C_Handle_t *hi2c, uint8_t addr,
     hi2c->Busy       = true;
     hi2c->State      = I2C_STATE_START;
 
-    /* Włącz przerwania I2C i wyślij START */
+    /*
+     * Włącz przerwania I2C i wyślij START.
+     * ITEVTEN — zdarzenia: SB, ADDR, BTF
+     * ITERREN  — błędy:    BERR, ARLO, AF, OVR
+     *
+     * START generuje przerwanie SB → maszyna stanów wysyła adres.
+     */
     hi2c->Config.Instance->CR2 |= I2C_CR2_ITEVTEN | I2C_CR2_ITERREN;
     hi2c->Config.Instance->CR1 |= I2C_CR1_START;
 
-    /* Task zasypia */
-    if (xSemaphoreTake(hi2c->Done,
-                       pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
-        hi2c->Busy = false;
+    /*
+     * Task zasypia na semaforze.
+     * Semafor daje I2C_DMA_TX_IRQHandler_CB po zakończeniu transferu
+     * lub I2C_IRQHandler_CB po wyczerpaniu retry.
+     *
+     * [FIX] Po timeout: zatrzymaj DMA, wyślij STOP, wyczyść stan —
+     *       bez tego hi2c->Busy zostaje true i kolejne wywołanie
+     *       natychmiast zwraca false z powodu warunku Busy na początku.
+     */
+    if (xSemaphoreTake(hi2c->Done, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        /* Timeout — posprzątaj po niekompletnej transakcji */
+        hi2c->Config.Instance->CR2 &= ~(I2C_CR2_ITEVTEN | I2C_CR2_ITERREN
+                                      | I2C_CR2_DMAEN   | I2C_CR2_LAST);
+        hi2c->Config.Instance->CR1 |=  I2C_CR1_STOP;
+        dma->CR &= ~DMA_SxCR_EN;
+        DMA_ClearFlags(dma);
+        hi2c->State = I2C_STATE_IDLE;
+        hi2c->Busy  = false;
+        hi2c->Error = true;
         return false;
     }
 
-    /* Wyłącz przerwania I2C */
-    hi2c->Config.Instance->CR2 &= ~(I2C_CR2_ITEVTEN | I2C_CR2_ITERREN);
-
+    /* Sukces lub błąd z retry — przerwania wyłączone już przez callback */
     return !hi2c->Error;
 }
 
 bool I2C_Read(I2C_Handle_t *hi2c, uint8_t addr, uint8_t reg,
               uint8_t *buf, uint16_t len, uint32_t timeout_ms) {
 
+    if (!hi2c || !buf || len == 0) return false;
     if (hi2c->Busy) return false;
 
-    /* Konfiguracja DMA RX */
+    /*
+     * Konfiguracja DMA RX.
+     *
+     * [FIX] DMA_ClearFlags zamiast hardkodowanego LIFCR dla Stream0 —
+     *       poprzednia wersja blokowała każdy stream inny niż Stream0.
+     *
+     * Uwaga: DMA RX NIE jest tu włączany (DMA_SxCR_EN).
+     * Włącza go maszyna stanów w I2C_STATE_ADDR_R po odebraniu ACK
+     * na adres+R — wtedy dopiero sprzęt jest gotowy na dane.
+     */
     DMA_Stream_TypeDef *dma_rx = hi2c->Config.DmaRxStream;
     dma_rx->CR = 0;
     while (dma_rx->CR & DMA_SxCR_EN);
-
-    DMA1->LIFCR = DMA_LIFCR_CTCIF0 | DMA_LIFCR_CHTIF0
-                | DMA_LIFCR_CTEIF0 | DMA_LIFCR_CDMEIF0
-                | DMA_LIFCR_CFEIF0;
+    DMA_ClearFlags(dma_rx);
 
     dma_rx->PAR  = (uint32_t)&hi2c->Config.Instance->DR;
     dma_rx->M0AR = (uint32_t)buf;
     dma_rx->NDTR = len;
     dma_rx->CR   = ((uint32_t)hi2c->Config.DmaRxChannel << DMA_SxCR_CHSEL_Pos)
-                 | DMA_SxCR_MINC
-                 | (0U << DMA_SxCR_DIR_Pos)
-                 | DMA_SxCR_TCIE;
+                 | DMA_SxCR_MINC            /* auto-increment adresu pamięci */
+                 | (0U << DMA_SxCR_DIR_Pos) /* kierunek: peryferium → pamięć */
+                 | DMA_SxCR_TCIE;           /* przerwanie po Transfer Complete */
 
     /* Parametry transakcji */
     hi2c->DevAddr    = addr;
@@ -460,15 +567,31 @@ bool I2C_Read(I2C_Handle_t *hi2c, uint8_t addr, uint8_t reg,
     hi2c->Config.Instance->CR2 |= I2C_CR2_ITEVTEN | I2C_CR2_ITERREN;
     hi2c->Config.Instance->CR1 |= I2C_CR1_START;
 
-    /* Task zasypia */
-    if (xSemaphoreTake(hi2c->Done,
-                       pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
-        hi2c->Busy = false;
+    /*
+     * Task zasypia na semaforze.
+     *
+     * [FIX] Po timeout: posprzątaj — tak samo jak w I2C_Write.
+     * Bez cleanup hi2c->Busy = true blokuje kolejne transakcje na zawsze.
+     */
+    if (xSemaphoreTake(hi2c->Done, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        hi2c->Config.Instance->CR2 &= ~(I2C_CR2_ITEVTEN | I2C_CR2_ITERREN
+                                      | I2C_CR2_DMAEN   | I2C_CR2_LAST);
+        hi2c->Config.Instance->CR1 |=  I2C_CR1_STOP;
+        dma_rx->CR &= ~DMA_SxCR_EN;
+        DMA_ClearFlags(dma_rx);
+        hi2c->State = I2C_STATE_IDLE;
+        hi2c->Busy  = false;
+        hi2c->Error = true;
         return false;
     }
 
-    /* Wyłącz przerwania I2C */
-    hi2c->Config.Instance->CR2 &= ~(I2C_CR2_ITEVTEN | I2C_CR2_ITERREN);
+    /*
+     * [FIX] Bariera synchronizacji danych po transferze DMA.
+     * DMA pisze do buf[] omijając pipeline CPU. Na Cortex-M4 bez D-cache
+     * zwykle działa bez bariery, ale __DSB() gwarantuje że wszystkie
+     * zapisy DMA są widoczne zanim caller odczyta buf[].
+     */
+    __DSB();
 
     return !hi2c->Error;
 }

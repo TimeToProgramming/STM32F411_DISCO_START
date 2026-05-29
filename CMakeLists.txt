@@ -34,10 +34,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS ON)
 
 # Core MCU flags, CPU type, instruction set and FPU setup
-set(cpu_PARAMS 
-    # Other parameters
-    # -mthumb
-    # -mcpu, -mfloat, -mfloat-abi, ...
+set(cpu_PARAMS
+    -mthumb
+    -mcpu=cortex-m4
+    -mfpu=fpv4-sp-d16
+    -mfloat-abi=hard
 )
 
 # Sources
@@ -55,6 +56,9 @@ set(sources_SRCS
     ${CMAKE_CURRENT_SOURCE_DIR}/Src/filters/filters.c
     ${CMAKE_CURRENT_SOURCE_DIR}/FreeRTOS/event_groups.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Src/i2c/i2c.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Src/lsm303/lsm303.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Src/attitude/attitude.c
+
 )
 
 # Include directories for all compilers
@@ -73,6 +77,9 @@ set(include_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/Src/filters
     ${CMAKE_CURRENT_SOURCE_DIR}/FreeRTOS/include
     ${CMAKE_CURRENT_SOURCE_DIR}/Src/i2c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Src/lsm303
+    ${CMAKE_CURRENT_SOURCE_DIR}/Src/attitude
+    
 )
 
 # Include directories for each compiler

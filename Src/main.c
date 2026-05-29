@@ -1,53 +1,66 @@
 #include "stm32f411xe.h"
 #include "FreeRTOS.h"
 #include "task.h"
+#include "event_groups.h"
 #include "gpio/gpio.h"
 #include "clock/clock.h"
 #include "timer/timer.h"
 #include "uart/uart.h"
 #include "spi/spi.h"
-#include "l3gd20/l3gd20.h"
-#include "filters/filters.h"
-#include "event_groups.h"
-#include <math.h>
 #include "i2c/i2c.h"
-
-
-#define GYRO_MAX_DPS  50.0f
-
-
-// Flaga — bit 0 = kalibracja skończona
-EventGroupHandle_t xSystemEvents;
-#define FLAG_CALIB_DONE  (1 << 0)
+#include "l3gd20/l3gd20.h"
+#include "lsm303/lsm303.h"
+#include "filters/filters.h"
+#include "attitude/attitude.h"
+#include <math.h>
 
 /* ================================================ */
 /*              KONFIGURACJA PWM                    */
 /* ================================================ */
 #define ARR_VAL     999   /* Okres PWM — PSC=99, ARR=999 → 1kHz przy APB1×2=100MHz */
 #define PWM_STEP    10    /* Krok CCR — im mniejszy tym płynniejsze ściemnianie */
-#define STEP_DELAY  5     /* Czas między krokami [ms] — reguluje szybkość animacji */
+#define STEP_DELAY  5     /* Czas między krokami [ms] */
+
+/* ================================================ */
+/*              FLAGI EVENTGROUP                    */
+/* ================================================ */
+EventGroupHandle_t xSystemEvents;
+#define FLAG_CALIB_DONE  (1 << 0)
 
 /* ================================================ */
 /*         GLOBALNE HANDLERY PERYFERÓW              */
 /* ================================================ */
-/*
- * Globalne — dostępne z każdego taska przez extern.
- * Inicjalizowane w main() przed startem schedulera.
- */
-UART_Handle_t   huart2;  /* USART2: PA2=TX, PA3=RX, 115200 baud */
-SPI_Handle_t    hspi1;   /* SPI1:   PA5=SCK, PA6=MISO, PA7=MOSI */
-L3GD20_Handle_t hgyro;   /* Żyroskop L3GD20: CS=PE3 */
-I2C_Handle_t hi2c1;
+UART_Handle_t    huart2;
+SPI_Handle_t     hspi1;
+I2C_Handle_t     hi2c1;
+L3GD20_Handle_t  hgyro;
+LSM303_Handle_t  haccel;
+AttitudeFilter_t attitude_filter;
 
+/* ================================================ */
+/*      HELPER — kąt [°] na wartość CCR PWM         */
+/* ================================================ */
+/*
+ * Przelicza bezwzględny kąt przechyłu na jasność diody.
+ * 0°                      → CCR = 0        (zgaszona)
+ * ATTITUDE_MAX_ANGLE_DEG  → CCR = ARR_VAL  (pełna jasność)
+ * Liniowo między 0 a max, klampowane do ARR_VAL.
+ */
+static uint32_t angle_to_ccr(float angle_deg) {
+    if (angle_deg <= 0.0f) return 0U;
+    float ratio = angle_deg / ATTITUDE_MAX_ANGLE_DEG;
+    if (ratio > 1.0f) ratio = 1.0f;
+    return (uint32_t)(ratio * (float)ARR_VAL);
+}
 
 /* ================================================ */
 /*              TASK PWM — animacja LED             */
 /* ================================================ */
 /*
- * Steruje czterema diodami przez TIM4 CH1-CH4 (PD12-PD15).
- * Każda dioda rozjaśnia się i gaśnie po kolei w nieskończonej pętli.
- * vTaskDelay oddaje procesor innym taskom podczas czekania —
- * zero busy-waiting w przeciwieństwie do HAL_Delay.
+ * Konfiguruje TIM4 CH1-CH4 (PD12-PD15) i animuje diody
+ * podczas kalibracji żyroskopu. Po ustawieniu FLAG_CALIB_DONE
+ * przez vAttitudeTask — task kończy animację i usuwa się.
+ * Od tej chwili LED steruje vAttitudeTask.
  */
 static void vPWMTask(void *pv) {
     (void)pv;
@@ -67,10 +80,7 @@ static void vPWMTask(void *pv) {
     GPIO_SetSpeed(GPIOD, 14, GPIO_SPEED_HIGH);
     GPIO_SetSpeed(GPIOD, 15, GPIO_SPEED_HIGH);
 
-    /*
-     * Inicjalizacja TIM4:
-     * PSC=99 → 1MHz, ARR=999 → 1kHz PWM
-     */
+    /* TIM4: PSC=99 → 1MHz, ARR=999 → 1kHz PWM */
     TIM_Config(TIM4, TIM_MODE_PWM, 99, ARR_VAL);
     TIM4->CR1 |= TIM_CR1_ARPE;
     TIM4->EGR |= TIM_EGR_UG;
@@ -82,12 +92,10 @@ static void vPWMTask(void *pv) {
 
     /*
      * Animacja podczas kalibracji — diody kręcą się w kółko.
-     * xEventGroupGetBits sprawdza flagę bez blokowania taska.
-     * Gdy task Gyro skończy kalibrację i ustawi flagę — wychodzimy.
+     * xEventGroupGetBits nie blokuje — sprawdza stan bez czekania.
      */
     while (!(xEventGroupGetBits(xSystemEvents) & FLAG_CALIB_DONE)) {
 
-        /* Rozjaśnianie po kolei CH1→CH2→CH3→CH4 */
         for (int ccr = 0; ccr <= ARR_VAL; ccr += PWM_STEP)
             { TIM_SetCCR(TIM4, 1, ccr); vTaskDelay(pdMS_TO_TICKS(STEP_DELAY)); }
         TIM_SetCCR(TIM4, 1, ARR_VAL);
@@ -104,7 +112,6 @@ static void vPWMTask(void *pv) {
             { TIM_SetCCR(TIM4, 4, ccr); vTaskDelay(pdMS_TO_TICKS(STEP_DELAY)); }
         TIM_SetCCR(TIM4, 4, ARR_VAL);
 
-        /* Gaszenie po kolei CH1→CH2→CH3→CH4 */
         for (int ccr = ARR_VAL; ccr >= 0; ccr -= PWM_STEP)
             { TIM_SetCCR(TIM4, 1, ccr); vTaskDelay(pdMS_TO_TICKS(STEP_DELAY)); }
         TIM_SetCCR(TIM4, 1, 0);
@@ -122,113 +129,179 @@ static void vPWMTask(void *pv) {
         TIM_SetCCR(TIM4, 4, 0);
     }
 
-    /*
-    * Kalibracja skończona — wszystkie diody zaświecają i gasną
-    * jako sygnał "gotowy do pracy"
-    */
-    for (int ccr = 0; ccr <= ARR_VAL; ccr += PWM_STEP)
-        { TIM_SetCCR(TIM4, 1, ccr);
+    /* Kalibracja skończona — wszystkie diody razem w górę i w dół */
+    for (int ccr = 0; ccr <= ARR_VAL; ccr += PWM_STEP) {
+        TIM_SetCCR(TIM4, 1, ccr);
         TIM_SetCCR(TIM4, 2, ccr);
         TIM_SetCCR(TIM4, 3, ccr);
         TIM_SetCCR(TIM4, 4, ccr);
-        vTaskDelay(pdMS_TO_TICKS(STEP_DELAY)); }
-
-    for (int ccr = ARR_VAL; ccr >= 0; ccr -= PWM_STEP)
-        { TIM_SetCCR(TIM4, 1, ccr);
+        vTaskDelay(pdMS_TO_TICKS(STEP_DELAY));
+    }
+    for (int ccr = ARR_VAL; ccr >= 0; ccr -= PWM_STEP) {
+        TIM_SetCCR(TIM4, 1, ccr);
         TIM_SetCCR(TIM4, 2, ccr);
         TIM_SetCCR(TIM4, 3, ccr);
         TIM_SetCCR(TIM4, 4, ccr);
-        vTaskDelay(pdMS_TO_TICKS(STEP_DELAY)); }
+        vTaskDelay(pdMS_TO_TICKS(STEP_DELAY));
+    }
 
     TIM_SetCCR(TIM4, 1, 0);
     TIM_SetCCR(TIM4, 2, 0);
     TIM_SetCCR(TIM4, 3, 0);
     TIM_SetCCR(TIM4, 4, 0);
 
+    /* Task skończył — od teraz LED steruje vAttitudeTask */
     vTaskDelete(NULL);
 }
 
 /* ================================================ */
-/*          TASK GYRO — odczyt żyroskopu            */
+/*          TASK ATTITUDE — czujniki + LED          */
 /* ================================================ */
 /*
- * Inicjalizuje L3GD20 i co 100ms odczytuje dane.
- * Wypisuje X/Y/Z przez UART — mutex w bibliotece UART
- * zadba o bezpieczeństwo przy równoległym dostępie.
- * Priorytet 2 — wyższy niż PWM żeby odczyt czujnika
- * nie był opóźniany przez animację LED.
+ * Zastępuje poprzednie vGyroTask i vAccelTask.
+ *
+ * Dlaczego jeden task zamiast dwóch:
+ *   Filtr komplementarny potrzebuje obu czujników w tej samej
+ *   iteracji. Osobne taski wymagałyby synchronizacji między sobą
+ *   (mutex/queue) — zbędna komplikacja.
+ *
+ * Mapowanie LED na przechył:
+ *
+ *         LD4 zielona  PD12  CH1 — przód (pitch < 0)
+ *
+ *  LD6 niebieska  PD15  CH4        LD3 pomarańczowa PD13 CH2
+ *  lewo (roll < 0)                 prawo (roll > 0)
+ *
+ *         LD5 czerwona PD14  CH3 — tył  (pitch > 0)
+ *
+ * Jasność: 0° = zgaszona, ATTITUDE_MAX_ANGLE_DEG = pełna jasność.
+ * Zawsze świeci tylko jedna dioda na każdej osi — przeciwna zgaszona.
  */
-static void vGyroTask(void *pv) {
+static void vAttitudeTask(void *pv) {
     (void)pv;
 
+    /* --- Inicjalizacja żyroskopu --- */
     if (!L3GD20_Init(&hgyro, &hspi1, GPIOE, 3, L3GD20_SCALE_250DPS)) {
         UART_Printf(&huart2, "L3GD20 init FAILED!\r\n");
         vTaskDelete(NULL);
     }
     UART_Printf(&huart2, "L3GD20 OK\r\n");
 
-    L3GD20_Data_t data;
-    Gyro_Offset_t offset;
+    /* --- Inicjalizacja akcelerometru --- */
+    if (!LSM303_Init(&haccel, &hi2c1, LSM303_SCALE_2G)) {
+        UART_Printf(&huart2, "LSM303 init FAILED!\r\n");
+        vTaskDelete(NULL);
+    }
+    UART_Printf(&huart2, "LSM303 OK\r\n");
 
-    UART_Printf(&huart2, "Calibrating — keep still!\r\n");
+    /* --- Kalibracja żyroskopu (płytka musi stać nieruchomo) --- */
+    Gyro_Offset_t offset;
+    UART_Printf(&huart2, "Calibrating gyro — keep still!\r\n");
     Gyro_Calibrate(&hgyro, &offset, 500);
     UART_Printf(&huart2, "Offsets: X=%.3f Y=%.3f Z=%.3f\r\n",
                 offset.x, offset.y, offset.z);
 
-    LPF_t lpf_x, lpf_y, lpf_z;
-    LPF_Init(&lpf_x, 0.15f);
-    LPF_Init(&lpf_y, 0.15f);
-    LPF_Init(&lpf_z, 0.15f);
+    /* --- Inicjalizacja filtra komplementarnego --- */
+    Attitude_Init(&attitude_filter);
 
-    /* Kalibracja skończona — obudź task PWM */
+    /* --- Filtry LPF na akcelerometr ---
+     *
+     * alpha=0.5: kompromis między tłumieniem spike'ów a opóźnieniem fazowym.
+     * Filtr komplementarny i tak tłumi akcelerometr przez 2% wagę (τ≈5s),
+     * więc agresywny LPF (alpha=0.15, τ≈57ms) był zbędny i szkodliwy.
+     */
+    LPF_t lpf_ax, lpf_ay, lpf_az;
+    LPF_Init(&lpf_ax, 0.5f);
+    LPF_Init(&lpf_ay, 0.5f);
+    LPF_Init(&lpf_az, 0.5f);
+
+    /* --- Powiadom task PWM że kalibracja skończona --- */
     xEventGroupSetBits(xSystemEvents, FLAG_CALIB_DONE);
 
+    /* --- Pętla główna 100Hz --- */
     for (;;) {
-        if (L3GD20_ReadDPS(&hgyro, &data)) {
 
-            /* Odejmij offset i przefiltruj */
-            Gyro_ApplyOffset(&data, &offset);
-            data.x = LPF_Update(&lpf_x, data.x);
-            data.y = LPF_Update(&lpf_y, data.y);
-            data.z = LPF_Update(&lpf_z, data.z);
+        /* 1. Żyroskop */
+        L3GD20_Data_t gyro;
+        bool gyro_ok = L3GD20_ReadDPS(&hgyro, &gyro);
 
-            /* ---- Wizualizacja na LEDach PWM ---- */
+        /* 2. Akcelerometr */
+        LSM303_Data_t accel;
+        bool accel_ok = LSM303_ReadG(&haccel, &accel);
 
-            /*
-             * Oś X → CH1 (zielona) i CH2 (pomarańczowa)
-             * Jasność proporcjonalna do prędkości kątowej
-             * MAX_DPS = pełna jasność
-             */
-            uint32_t ccr_x = (uint32_t)(fabsf(data.x) / GYRO_MAX_DPS * 999.0f);
-            if (ccr_x > 999) ccr_x = 999;
-
-            if (data.x > 0.0f) {
-                TIM_SetCCR(TIM4, 2, ccr_x);  /* pomarańczowa */
-                TIM_SetCCR(TIM4, 1, 0);       /* zgaś zieloną */
-            } else {
-                TIM_SetCCR(TIM4, 1, ccr_x);  /* zielona */
-                TIM_SetCCR(TIM4, 2, 0);       /* zgaś pomarańczową */
-            }
-
-            /*
-             * Oś Y → CH3 (czerwona) i CH4 (niebieska)
-             */
-            uint32_t ccr_y = (uint32_t)(fabsf(data.y) / GYRO_MAX_DPS * 999.0f);
-            if (ccr_y > 999) ccr_y = 999;
-
-            if (data.y > 0.0f) {
-                TIM_SetCCR(TIM4, 4, ccr_y);  /* niebieska */
-                TIM_SetCCR(TIM4, 3, 0);       /* zgaś czerwoną */
-            } else {
-                TIM_SetCCR(TIM4, 3, ccr_y);  /* czerwona */
-                TIM_SetCCR(TIM4, 4, 0);       /* zgaś niebieską */
-            }
-
-            UART_Printf(&huart2,
-                        "X: %6.2f  Y: %6.2f  Z: %6.2f [deg/s]\r\n",
-                        data.x, data.y, data.z);
+        if (!gyro_ok || !accel_ok) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
         }
-        vTaskDelay(pdMS_TO_TICKS(10));
+
+        /* 3. Odejmij offset kalibracji żyroskopu */
+        Gyro_ApplyOffset(&gyro, &offset);
+
+        /* 4. Filtr LPF na akcelerometr */
+        accel.x = LPF_Update(&lpf_ax, accel.x);
+        accel.y = LPF_Update(&lpf_ay, accel.y);
+        accel.z = LPF_Update(&lpf_az, accel.z);
+
+        /* 5. Filtr komplementarny → kąty roll i pitch */
+        Attitude_t att;
+        Attitude_Update(&attitude_filter,
+                        accel.x, accel.y, accel.z,
+                        gyro.x,  gyro.y,
+                        &att);
+
+        /* ---- Sterowanie LED wg schematu Discovery ----
+         *
+         * Orientacja użytkownika (USB/Blue=przód, D w kompasie):
+         *
+         *          U = Orange PD13 CH2  (tył)
+         *
+         * L = Green PD12 CH1       R = Red PD14 CH3
+         *    (lewo)                        (prawo)
+         *
+         *          D = Blue  PD15 CH4  (przód/USB)
+         *
+         * Konwencja: dioda wskazuje kierunek przechyłu
+         * (jak wskaźnik samolotowy — nos idzie w górę → górna pomarańczowa).
+         *
+         * Pitch (przód/tył):
+         *   pitch < 0 → USB/nos idzie w górę → LD3 pomarańczowa (U, góra)
+         *   pitch > 0 → tył idzie w górę     → LD6 niebieska   (D, dół/USB)
+         *
+         * Roll (lewo/prawo):
+         *   roll < 0 → lewy bok w górze  → LD5 czerwona (R, prawo) — niski bok
+         *   roll > 0 → prawy bok w górze → LD4 zielona  (L, lewo)  — niski bok
+         */
+
+        /* Pitch → pomarańczowa (U) lub niebieska (D) */
+        uint32_t ccr_pitch = angle_to_ccr(fabsf(att.pitch));
+        if (att.pitch < 0.0f) {
+            TIM_SetCCR(TIM4, 2, ccr_pitch); /* nos w górze: LD3 pomarańczowa (U) */
+            TIM_SetCCR(TIM4, 4, 0);
+        } else {
+            TIM_SetCCR(TIM4, 4, ccr_pitch); /* tył w górze: LD6 niebieska (D) */
+            TIM_SetCCR(TIM4, 2, 0);
+        }
+
+        /* Roll → czerwona (R) lub zielona (L) */
+        uint32_t ccr_roll = angle_to_ccr(fabsf(att.roll));
+        if (att.roll < 0.0f) {
+            TIM_SetCCR(TIM4, 3, ccr_roll);  /* lewy bok w górze: LD5 czerwona (R) */
+            TIM_SetCCR(TIM4, 1, 0);
+        } else {
+            TIM_SetCCR(TIM4, 1, ccr_roll);  /* prawy bok w górze: LD4 zielona (L) */
+            TIM_SetCCR(TIM4, 3, 0);
+        }
+
+        /* 6. Log UART */
+        UART_Printf(&huart2,
+            "Roll: %6.1f  Pitch: %6.1f [deg]  "
+            "GX: %5.2f  GY: %5.2f [dps]  "
+            "AX: %5.2f  AY: %5.2f  AZ: %5.2f [g]\r\n",
+            att.roll, att.pitch,
+            gyro.x,  gyro.y,
+            accel.x, accel.y, accel.z);
+
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
@@ -236,20 +309,13 @@ static void vGyroTask(void *pv) {
 /*                      MAIN                        */
 /* ================================================ */
 int main(void) {
-    /*
-     * Zegar — pierwsze co robimy po resecie.
-     * HSE 8MHz → PLL → SYSCLK 100MHz.
-     * Bez tego peryferia taktowane z HSI 16MHz.
-     */
+
+    /* Zegar — pierwsze co robimy po resecie */
     SystemClock_Config();
+
     xSystemEvents = xEventGroupCreate();
 
-    /*
-     * UART2: PA2=TX, PA3=RX, 115200 baud
-     * APB1=50MHz → ClockFreq=50000000
-     * DMA1 Stream6 Ch4 = USART2_TX
-     * DMA1 Stream5 Ch4 = USART2_RX
-     */
+    /* ---- UART2: PA2=TX, PA3=RX, 115200 baud ---- */
     const UART_Config_t uart2_cfg = {
         .Instance     = USART2,
         .BaudRate     = 115200,
@@ -265,14 +331,7 @@ int main(void) {
     };
     UART_Init(&huart2, &uart2_cfg);
 
-    /*
-     * SPI1: PA5=SCK, PA6=MISO, PA7=MOSI, AF5
-     * APB2=100MHz, BaudDiv=3 → 6.25MHz (L3GD20 max 10MHz)
-     * Mode 0 (CPOL=0, CPHA=0) — testujemy wg datasheet Fig.12
-     * "driven on falling, captured on rising edge"
-     * DMA2 Stream3 Ch3 = SPI1_TX
-     * DMA2 Stream0 Ch3 = SPI1_RX
-     */
+    /* ---- SPI1: PA5=SCK, PA6=MISO, PA7=MOSI ---- */
     const SPI_Config_t spi1_cfg = {
         .Instance     = SPI1,
         .ClockFreq    = 100000000U,
@@ -286,22 +345,23 @@ int main(void) {
         .DmaRxChannel = 3,
         .DmaRxIRQn    = DMA2_Stream0_IRQn,
         .NvicPriority = configLIBRARY_MAX_SYSCALL_IRQ_PRIORITY,
-        .CPOL         = 0,   /* SCK idle LOW */
-        .CPHA         = 0,   /* próbkuj na rosnącym zboczu */
-        .BaudDiv      = 3    /* /16 = 6.25MHz */
+        .CPOL         = 0,
+        .CPHA         = 0,
+        .BaudDiv      = 3
     };
     SPI_Init(&hspi1, &spi1_cfg);
 
+    /* ---- I2C1: PB6=SCL, PB9=SDA, 400kHz ---- */
     const I2C_Config_t i2c1_cfg = {
         .Instance      = I2C1,
-        .ClockSpeed    = 400000U,        // 400kHz — fast mode
-        .ApbClockFreq  = 50000000U,      // APB1 = 50MHz
+        .ClockSpeed    = 400000U,
+        .ApbClockFreq  = 50000000U,
         .SclPort       = GPIOB, .SclPin = 6, .SclAF = 4,
         .SdaPort       = GPIOB, .SdaPin = 9, .SdaAF = 4,
-        .DmaTxStream   = DMA1_Stream1,   // I2C1 TX = Stream1 Ch0
+        .DmaTxStream   = DMA1_Stream1,
         .DmaTxChannel  = 0,
         .DmaTxIRQn     = DMA1_Stream1_IRQn,
-        .DmaRxStream   = DMA1_Stream0,   // I2C1 RX = Stream0 Ch1
+        .DmaRxStream   = DMA1_Stream0,
         .DmaRxChannel  = 1,
         .DmaRxIRQn     = DMA1_Stream0_IRQn,
         .EventIRQn     = I2C1_EV_IRQn,
@@ -309,23 +369,13 @@ int main(void) {
         .NvicPriority  = configLIBRARY_MAX_SYSCALL_IRQ_PRIORITY,
         .MaxRetry      = 3
     };
-
     I2C_Init(&hi2c1, &i2c1_cfg);
 
-    /*
-     * Tworzenie tasków — rejestracja, nie uruchamiają się jeszcze.
-     * Stack 256 słów = 1KB RAM dla PWM.
-     * Stack 512 słów = 2KB RAM dla GYRO (float, printf).
-     * Priorytet GYRO=2 > PWM=1 — czujnik ważniejszy niż animacja.
-     */
-    xTaskCreate(vPWMTask,  "PWM",  256, NULL, 1, NULL);
-    xTaskCreate(vGyroTask, "GYRO", 512, NULL, 2, NULL);
+    /* ---- Taski ---- */
+    xTaskCreate(vPWMTask,      "PWM", 256, NULL, 1, NULL);
+    xTaskCreate(vAttitudeTask, "ATT", 768, NULL, 2, NULL);
 
-    /*
-     * Start schedulera — FreeRTOS przejmuje kontrolę.
-     * Nigdy nie wraca. Jeśli wróci (brak pamięci) —
-     * wpadamy w nieskończoną pętlę zamiast wykonywać losowy kod.
-     */
+    /* Start schedulera — nigdy nie wraca */
     vTaskStartScheduler();
     for (;;) {}
 }
